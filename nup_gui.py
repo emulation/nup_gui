@@ -214,7 +214,7 @@ class NavButton(tk.Frame):
         self.n_active = False
         self.n_bar = tk.Frame(self, width=px(4), bg=SIDE)
         self.n_bar.pack(side="left", fill="y")
-        self.n_lbl = tk.Label(self, text=f"{icon}   {text}", bg=SIDE, fg=MUTED,
+        self.n_lbl = tk.Label(self, text=f"{icon}    {text}", bg=SIDE, fg=MUTED,
                               font=(FAM, 11), anchor="w", padx=px(14), pady=px(11))
         self.n_lbl.pack(side="left", fill="x", expand=True)
         for w in (self, self.n_lbl, self.n_bar):
@@ -347,8 +347,11 @@ class App(tk.Tk):
         c1, b1 = self._card(main, pad=12)
         c1.pack(fill="x")
         tk.Label(b1, text="PROGRAMA NUP", bg=CARD, fg=MUTED, font=(FAM, 8, "bold")).pack(side="left", padx=(0, px(12)))
-        auto = find_nup()
-        self.nup_var = tk.StringVar(value=auto[0] if len(auto) == 1 else "")
+        
+        # Carga desde config.json o usa el buscador automático
+        initial_nup = self._load_config()
+        self.nup_var = tk.StringVar(value=initial_nup)
+        
         e = self._entry(b1, self.nup_var)
         e.pack(side="left", fill="x", expand=True, ipady=px(6))
         RoundButton(b1, "Examinar", self._browse_nup, CARD, color=BTN2, hover=BTN2_H,
@@ -634,7 +637,9 @@ class App(tk.Tk):
         p = filedialog.askopenfilename(
             filetypes=[("Ejecutable", "*.exe" if os.name == "nt" else "*"), ("Todos", "*.*")])
         if p:
-            self.nup_var.set(os.path.normpath(p))
+            norm_path = os.path.normpath(p)
+            self.nup_var.set(norm_path)
+            self._save_config(norm_path)  # Guarda automáticamente en config.json
 
     def _need(self, what):
         messagebox.showwarning("Faltan datos", f"Indica {what}.")
@@ -656,7 +661,6 @@ class App(tk.Tk):
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
         if not self.running:
-            # sin nada ejecutándose: limpiar también estado, barra y tiempos
             self._set_status("Listo.", TEXT)
             self.pbar.reset()
             self.pct_var.set("")
@@ -680,18 +684,33 @@ class App(tk.Tk):
             pass
         self.destroy()
 
-    # ---------- ejecucion ----------
-    def _base_cmd(self):
-        custom = self.nup_var.get().strip().strip('"')
-        return [custom] if custom else [sys.executable, "-m", "nup.cli"]
-
+    # ---------- ejecucion con cwd y solucion para PyInstaller ----------
     def _run(self, args):
         if self.running:
             return
-        cmd = self._base_cmd() + args
+        
+        custom = self.nup_var.get().strip().strip('"')
+        
+        if custom:
+            exe_path = Path(custom).resolve()
+            cwd = str(exe_path.parent)
+            base = [str(exe_path)] # Usamos la ruta completa, es más seguro
+            
+            # TRUCO MAESTRO: Añadimos la carpeta del .exe al PATH para esta ejecución
+            os.environ["PATH"] = cwd + os.pathsep + os.environ.get("PATH", "")
+        else:
+            cwd = None
+            base = [sys.executable, "-m", "nup.cli"]
+
+        cmd = base + args
+        
         if self.log.get("1.0", "end-1c").strip():
             self._write("\n")
-        self._write("$ " + subprocess.list2cmdline(cmd) + "\n", "cmd")
+        
+        # Log visual
+        display_cmd = subprocess.list2cmdline([custom if custom else "python -m nup.cli"] + args)
+        self._write("$ " + display_cmd + "\n", "cmd")
+        
         self._set_status("Ejecutando…", CYAN)
         self._set_busy(True)
         self.stopped = False
@@ -703,19 +722,29 @@ class App(tk.Tk):
         self.pbar.start()
         self._write(f"[inicio {self.t_start:%H:%M:%S}]\n", "info")
         self._refresh_time()
-        threading.Thread(target=self._worker, args=(cmd,), daemon=True).start()
+        
+        # Enviamos el comando real y el cwd
+        threading.Thread(target=self._worker, args=(cmd, cwd), daemon=True).start()
 
-    def _worker(self, cmd):
+    def _worker(self, cmd, cwd=None):
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+        
+        # Si estamos en la carpeta de nup, forzamos a Python a buscar ahí
+        if cwd:
+            project_dir = str(Path(cwd).parent)
+            env["PYTHONPATH"] = project_dir + os.pathsep + env.get("PYTHONPATH", "")
+
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
+            # Aquí pasamos el cwd correctamente
             self.proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                encoding="utf-8", errors="replace", env=env, creationflags=flags)
+                encoding="utf-8", errors="replace", env=env, creationflags=flags, cwd=cwd
+            )
             for line in self.proc.stdout:
                 self.q.put(("out", line))
             self.q.put(("done", self.proc.wait()))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self.q.put(("out", f"Error al ejecutar: {e}\n"))
             self.q.put(("done", -1))
 
@@ -784,6 +813,32 @@ class App(tk.Tk):
         self.t_in.set(f"{self.t_start:%H:%M:%S}")
         self.t_out.set(f"{self.t_end:%H:%M:%S}" if self.t_end else "--:--:--")
         self.t_dur.set(self._duration())
+
+    def _load_config(self):
+        """Carga la ruta guardada previamente desde config.json."""
+        config_path = Path(sys.argv[0]).resolve().parent / "config.json"
+        try:
+            if config_path.exists():
+                import json
+                with open(config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    saved_nup = data.get("nup_path", "")
+                    if saved_nup and os.path.exists(saved_nup):
+                        return saved_nup
+        except Exception:
+            pass
+        auto = find_nup()
+        return auto[0] if len(auto) == 1 else ""
+
+    def _save_config(self, path):
+        """Guarda la ruta actual en config.json automáticamente."""
+        config_path = Path(sys.argv[0]).resolve().parent / "config.json"
+        try:
+            import json
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump({"nup_path": path}, f, indent=4)
+        except Exception:
+            pass
 
 
 def main():
